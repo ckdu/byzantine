@@ -189,6 +189,7 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.setHeader('Pragma', 'no-cache'); // For HTTP/1.0 compatibility
   res.setHeader('Expires', '0');
+  res.setHeader('Vary', 'Cookie');
   // --- End Cache-Control Headers ---
 
   // Validation: Check if filename ends with .pdf
