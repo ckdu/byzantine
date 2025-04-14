@@ -24,10 +24,10 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: process.env.NODE_ENV === 'production', // false for http://localhost
+    secure: false,
     httpOnly: true,
     sameSite: 'lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
   }
 }));
 
@@ -180,7 +180,22 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     const approved = await isUserApproved(userEmail);
     if (!approved) {
       console.log(`Access denied for ${userEmail} (Not Approved)`);
-      return res.status(403).send('Access Denied: Your email is not approved.');
+
+      // Send back HTML with a helpful message and the link
+      res.status(403).send(`
+        <html>
+          <head><title>Access Denied</title></head>
+          <body style="font-family: sans-serif; padding: 20px;">
+            <h1>Access Denied</h1>
+            <p>Your email (${userEmail}) is logged in, but has not yet been approved for downloads.</p>
+            <p>If you haven't registered yet, please fill out the access request form:</p>
+            <p><a href="${process.env.GOOGLE_FORMS_LINK}" target="_blank">Request Access Form</a></p>
+            <p>If you have already registered, please wait for your request to be approved. Thank you for your patience.</p>
+          </body>
+        </html>
+      `);
+      return;
+
     }
     console.log(`Access granted for ${userEmail}`);
 
