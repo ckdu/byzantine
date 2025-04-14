@@ -24,7 +24,7 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: false,
+    secure: process.env.NODE_ENV === 'production', // Use true in prod (HTTPS)
     httpOnly: true,
     sameSite: 'lax',
     maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
@@ -63,7 +63,7 @@ async function getApprovedUserName(email) {
         const startCol = columns[0];
         const endCol = columns[columns.length - 1];
         const range = `${process.env.APPROVED_SHEET_NAME}!${startCol}:${endCol}`;
-        console.log(`Fetching range: ${range}`);
+        // console.log(`Fetching range: ${range}`); // Less verbose
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -84,7 +84,7 @@ async function getApprovedUserName(email) {
                 const rowFullName = row[nameColIndex];
 
                 if (rowEmail && rowEmail.toLowerCase() === email.toLowerCase()) {
-                    console.log(`Found email match for ${email}. Approved status: ${rowApprovedStatus}, Name: ${rowFullName}`);
+                    // console.log(`Found email match for ${email}. Approved status: ${rowApprovedStatus}, Name: ${rowFullName}`); // Less verbose
                     // Check if approved status is exactly 'TRUE' (case-insensitive)
                     if (rowApprovedStatus && rowApprovedStatus.toUpperCase() === 'TRUE') {
                         // Return the Full Name found in the sheet, default to empty string if missing
@@ -101,7 +101,8 @@ async function getApprovedUserName(email) {
         console.log(`Email ${email} not found in the sheet.`);
         return null; // Return null if email is not found
     } catch (err) {
-        console.error('Error checking Google Sheet:', err.message);
+        const errorMessage = err.response?.data?.error?.message || err.message;
+        console.error(`Error checking Google Sheet: ${errorMessage}`);
         return null; // Return null on error
     }
 }
@@ -179,9 +180,16 @@ app.get('/logout', (req, res) => {
 });
 
 
-// DYNAMIC PDF View Endpoint (Using Full Name from Sheet)
+// DYNAMIC PDF View Endpoint (Using Full Name from Sheet + Cache Control)
 app.get('/view/:filename', isAuthenticated, async (req, res) => {
   const requestedFilename = req.params.filename;
+
+  // --- Set Cache-Control headers early for all responses on this path ---
+  // Prevents caching of denial messages, errors, and the final PDF
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache'); // For HTTP/1.0 compatibility
+  res.setHeader('Expires', '0');
+  // --- End Cache-Control Headers ---
 
   // Validation: Check if filename ends with .pdf
   if (!requestedFilename || !requestedFilename.toLowerCase().endsWith('.pdf')) {
@@ -195,10 +203,10 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
 
   if (!req.session || !req.session.user) {
     console.error("User session missing in view route after isAuthenticated passed!");
+    // Send error with cache headers already set
     return res.status(500).send("Internal Server Error: Session lost.");
   }
   const userEmail = req.session.user.email;
-  // We will get the name to use from the approval check function
   const parentFolderId = process.env.DRIVE_PDF_FOLDER_ID;
   const googleFormsLink = process.env.GOOGLE_FORMS_LINK || '#'; // Fallback link
 
@@ -210,10 +218,9 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     // 1. Check Approval AND get Full Name from Sheet
     const sheetFullName = await getApprovedUserName(userEmail);
 
-    // Check if sheetFullName is null (meaning not found or not approved)
     if (sheetFullName === null) {
       console.log(`Access denied for ${userEmail} (Not Approved or Not Found in Sheet)`);
-      // Send back HTML with a helpful message and the link
+      // Send back HTML denial message (Cache headers already set)
       res.status(403).send(`
         <html>
           <head><title>Access Denied</title></head>
@@ -229,11 +236,8 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
       return; // Stop execution
     }
 
-    // If we reach here, user is approved, and sheetFullName contains the name from the sheet
-    // Use sheetFullName, but fallback to an empty string if it was somehow empty in the sheet
-    const nameForWatermark = sheetFullName || 'Approved User'; // Use the name from the sheet
+    const nameForWatermark = sheetFullName || 'Approved User';
     console.log(`Access granted for ${userEmail}. Using name: "${nameForWatermark}"`);
-
 
     // 2. Find File ID in Google Drive by Name
     console.log(`Searching for filename "${requestedFilename}" in folder ID "${parentFolderId}"`);
@@ -245,6 +249,7 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
 
     if (!searchResponse.data.files || searchResponse.data.files.length === 0) {
         console.log(`File not found in Drive: ${requestedFilename}`);
+        // Send 404 with cache headers already set
         return res.status(404).send('File not found.');
     }
     if (searchResponse.data.files.length > 1) {
@@ -268,7 +273,6 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const obliqueFont = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
     const timestamp = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
-    // Use the name fetched from the Google Sheet for the watermark
     const watermarkText = `Authorized liturgical use for ${nameForWatermark}. Generated: ${timestamp}`;
     const pages = pdfDoc.getPages();
     const fontSize = 8; const textGray = rgb(0.5, 0.5, 0.5);
@@ -277,20 +281,22 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     console.log(`Watermarked PDF size: ${watermarkedPdfBytes.length} bytes.`);
 
     // 5. Send the watermarked PDF
-    const safeUserName = nameForWatermark.replace(/[^a-z0-9]/gi, '_').toLowerCase(); // Use sheet name for output file too
+    const safeUserName = nameForWatermark.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const outputFilename = `${path.parse(actualFilename).name}_${safeUserName}.pdf`;
+    // Set Content-Type and Disposition (Cache headers already set)
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${outputFilename}"`); // Display inline
+    res.setHeader('Content-Disposition', `inline; filename="${outputFilename}"`);
     res.send(Buffer.from(watermarkedPdfBytes));
 
   } catch (error) {
-    // Error Handling (same as before)
+    // Error Handling (Cache headers already set)
     let fileIdForError = 'N/A';
      if (typeof fileId !== 'undefined') { fileIdForError = fileId; }
     if (error.response && error.response.status) {
          console.error(`Google API Error (Status: ${error.response.status}) during operation for file '${requestedFilename}' (Drive ID: ${fileIdForError}):`, error.response.data || error.message);
-         if (error.response.status === 404) { res.status(404).send('File not found in Drive or backend lacks permission.'); }
-         else if (error.response.status === 403) { res.status(403).send('Permission denied accessing Google Drive/Sheets. Check API Key restrictions or Service Account permissions.'); }
+         const status = error.response.status;
+         if (status === 404) { res.status(404).send('File not found in Drive or backend lacks permission.'); }
+         else if (status === 403) { res.status(403).send('Permission denied accessing Google Drive/Sheets. Check API Key restrictions or Service Account permissions.'); }
          else { res.status(500).send('Error communicating with Google services.'); }
     } else if (error.message.includes('Sheet')) {
          console.error('Error accessing Google Sheet:', error);
