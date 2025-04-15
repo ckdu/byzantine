@@ -218,12 +218,12 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
         x: 30, y: 20, size: 8, font: obliqueFont, color: rgb(0.5, 0.5, 0.5)
       });
     });
-    const watermarkedPdfBytes = await pdfDoc.save();
+    const watermarkedPdfBytes = Buffer.from(await pdfDoc.save());
     pdfCache.set(cacheKey, watermarkedPdfBytes);
-
+    
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${requestedFilename}"`);
-    res.send(Buffer.from(watermarkedPdfBytes));
+    res.send(watermarkedPdfBytes);    
   } catch (error) {
     console.error('View route error:', error);
     res.status(500).send('Error processing your request.');
