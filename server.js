@@ -4,10 +4,15 @@ const session = require('express-session');
 const { OAuth2Client } = require('google-auth-library');
 const { google } = require('googleapis');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const path = require('path'); // Needed for filename extraction and extension check
+const path = require('path');
+const NodeCache = require('node-cache');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// --- Caching Setup ---
+const driveCache = new NodeCache({ stdTTL: 86400 }); // 1 day for original PDFs
+const pdfCache = new NodeCache({ stdTTL: 7200 });   // 2 hours for watermarked PDFs
 
 // --- Google API Clients ---
 const oauth2Client = new OAuth2Client(
@@ -31,286 +36,200 @@ app.use(session({
   }
 }));
 
-// --- Middleware ---
 function isAuthenticated(req, res, next) {
-  if (req.session && req.session.user) {
-    // console.log('User is authenticated:', req.session.user.email); // Less verbose
-    return next();
-  }
+  if (req.session && req.session.user) return next();
   console.log('User not authenticated, redirecting to login.');
   res.redirect('/auth/google');
 }
 
-
-// --- Helper Functions ---
-/**
- * Checks if a user email is approved in the Google Sheet.
- * @param {string} email The user's email address.
- * @returns {Promise<string|null>} The Full Name from the sheet if approved, otherwise null.
- */
 async function getApprovedUserName(email) {
-    if (!email) return null;
-    console.log(`Checking approval for: ${email}`);
-    try {
-        // Determine the start and end columns needed to include Email, Full Name, and Approved status
-        const columns = [
-            process.env.EMAIL_COLUMN_LETTER,
-            process.env.FULL_NAME_COLUMN_LETTER,
-            process.env.APPROVED_COLUMN_LETTER
-        ];
-        // Sort column letters alphabetically to determine range start/end
-        columns.sort();
-        const startCol = columns[0];
-        const endCol = columns[columns.length - 1];
-        const range = `${process.env.APPROVED_SHEET_NAME}!${startCol}:${endCol}`;
-        // console.log(`Fetching range: ${range}`); // Less verbose
+  if (!email) return null;
+  try {
+    const columns = [
+      process.env.EMAIL_COLUMN_LETTER,
+      process.env.FULL_NAME_COLUMN_LETTER,
+      process.env.APPROVED_COLUMN_LETTER
+    ];
+    columns.sort();
+    const startCol = columns[0];
+    const endCol = columns[columns.length - 1];
+    const range = `${process.env.APPROVED_SHEET_NAME}!${startCol}:${endCol}`;
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: range,
+    });
 
-        const response = await sheets.spreadsheets.values.get({
-            spreadsheetId: process.env.GOOGLE_SHEET_ID,
-            range: range,
-        });
+    const rows = response.data.values;
+    if (rows && rows.length) {
+      const startCharCode = startCol.charCodeAt(0);
+      const emailColIndex = process.env.EMAIL_COLUMN_LETTER.charCodeAt(0) - startCharCode;
+      const nameColIndex = process.env.FULL_NAME_COLUMN_LETTER.charCodeAt(0) - startCharCode;
+      const approvedColIndex = process.env.APPROVED_COLUMN_LETTER.charCodeAt(0) - startCharCode;
 
-        const rows = response.data.values;
-        if (rows && rows.length) {
-            // Calculate the relative indices based on the fetched range's start column
-            const startCharCode = startCol.charCodeAt(0);
-            const emailColIndex = process.env.EMAIL_COLUMN_LETTER.charCodeAt(0) - startCharCode;
-            const nameColIndex = process.env.FULL_NAME_COLUMN_LETTER.charCodeAt(0) - startCharCode;
-            const approvedColIndex = process.env.APPROVED_COLUMN_LETTER.charCodeAt(0) - startCharCode;
+      for (const row of rows) {
+        const rowEmail = row[emailColIndex];
+        const rowApprovedStatus = row[approvedColIndex];
+        const rowFullName = row[nameColIndex];
 
-            for (const row of rows) {
-                const rowEmail = row[emailColIndex];
-                const rowApprovedStatus = row[approvedColIndex];
-                const rowFullName = row[nameColIndex];
-
-                if (rowEmail && rowEmail.toLowerCase() === email.toLowerCase()) {
-                    // console.log(`Found email match for ${email}. Approved status: ${rowApprovedStatus}, Name: ${rowFullName}`); // Less verbose
-                    // Check if approved status is exactly 'TRUE' (case-insensitive)
-                    if (rowApprovedStatus && rowApprovedStatus.toUpperCase() === 'TRUE') {
-                        // Return the Full Name found in the sheet, default to empty string if missing
-                        return rowFullName || '';
-                    } else {
-                        // Found the email, but not approved
-                        console.log(`Email ${email} found but not approved.`);
-                        return null; // Explicitly return null for "found but not approved"
-                    }
-                }
-            }
+        if (rowEmail && rowEmail.toLowerCase() === email.toLowerCase()) {
+          if (rowApprovedStatus && rowApprovedStatus.toUpperCase() === 'TRUE') {
+            return rowFullName || '';
+          } else {
+            console.log(`Email ${email} found but not approved.`);
+            return null;
+          }
         }
-        // Email was not found in the sheet at all
-        console.log(`Email ${email} not found in the sheet.`);
-        return null; // Return null if email is not found
-    } catch (err) {
-        const errorMessage = err.response?.data?.error?.message || err.message;
-        console.error(`Error checking Google Sheet: ${errorMessage}`);
-        return null; // Return null on error
+      }
     }
+    console.log(`Email ${email} not found in the sheet.`);
+    return null;
+  } catch (err) {
+    console.error(`Error checking Google Sheet: ${err.response?.data?.error?.message || err.message}`);
+    return null;
+  }
 }
-
 
 // --- Routes ---
 
-// Landing Page
 app.get('/', (req, res) => {
-    res.send('Byzantine Backend. <a href="/auth/google">Login with Google</a>');
+  res.send('Byzantine Backend. <a href="/auth/google">Login with Google</a>');
 });
 
-// Google OAuth Flow Start
 app.get('/auth/google', (req, res) => {
-    const authorizeUrl = oauth2Client.generateAuthUrl({
-        access_type: 'online',
-        scope: [
-            'https://www.googleapis.com/auth/userinfo.profile',
-            'https://www.googleapis.com/auth/userinfo.email',
-            'openid'
-        ],
-        // prompt: 'consent' // Optional for testing
-    });
-    res.redirect(authorizeUrl);
+  const authorizeUrl = oauth2Client.generateAuthUrl({
+    access_type: 'online',
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'openid'
+    ]
+  });
+  res.redirect(authorizeUrl);
 });
 
-// Google OAuth Callback
 app.get('/auth/google/callback', async (req, res) => {
-    const code = req.query.code;
-    if (!code) {
-        return res.status(400).send('Missing authorization code.');
-    }
-    try {
-        const { tokens } = await oauth2Client.getToken(code);
-        oauth2Client.setCredentials(tokens);
-
-        const userInfo = await oauth2Client.request({ url: 'https://www.googleapis.com/oauth2/v3/userinfo' });
-        // Store only essential info needed later (email for approval check, maybe google name as fallback)
-        const user = {
-            email: userInfo.data.email,
-            googleName: userInfo.data.name, // Store Google name as a fallback if needed
-        };
-        console.log('User authenticated:', user.email);
-
-        req.session.user = user; // Store minimal user object in session
-
-        req.session.save(err => {
-            if (err) {
-                console.error("Session save error:", err);
-                return res.status(500).send('Authentication failed during session save.');
-            }
-            // !!! IMPORTANT: Replace this URL with your actual Google Site page !!!
-            res.redirect('https://sites.google.com/view/byzant');
-        });
-
-    } catch (error) {
-        console.error('Error during Google OAuth callback:', error.response ? error.response.data : error.message);
-        res.status(500).send('Authentication failed');
-    }
-});
-
-// Logout
-app.get('/logout', (req, res) => {
-    const userEmail = req.session.user ? req.session.user.email : 'User';
-    req.session.destroy(err => {
-        if (err) {
-            console.error("Logout error:", err);
-            return res.status(500).send('Could not log out.');
-        }
-        res.clearCookie('connect.sid');
-        console.log(`${userEmail} logged out.`);
-         // !!! IMPORTANT: Replace this URL with your actual Google Site page !!!
-        res.redirect('https://sites.google.com/view/byzant');
-    });
-});
-
-
-// DYNAMIC PDF View Endpoint (Using Full Name from Sheet + Cache Control)
-app.get('/view/:filename', isAuthenticated, async (req, res) => {
-  const requestedFilename = req.params.filename;
-
-  // --- Set Cache-Control headers early for all responses on this path ---
-  // Prevents caching of denial messages, errors, and the final PDF
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
-  res.setHeader('Pragma', 'no-cache'); // For HTTP/1.0 compatibility
-  res.setHeader('Expires', '0');
-  res.setHeader('Vary', 'Cookie');
-  // --- End Cache-Control Headers ---
-
-  // Validation: Check if filename ends with .pdf
-  if (!requestedFilename || !requestedFilename.toLowerCase().endsWith('.pdf')) {
-      console.log(`Invalid request: Filename does not end with .pdf (${requestedFilename})`);
-      return res.status(400).send('Invalid request: Filename must end with .pdf');
-  }
-  // Basic sanitization
-  if (requestedFilename.includes('/') || requestedFilename.includes('..')) {
-      return res.status(400).send('Invalid filename.');
-  }
-
-  if (!req.session || !req.session.user) {
-    console.error("User session missing in view route after isAuthenticated passed!");
-    // Send error with cache headers already set
-    return res.status(500).send("Internal Server Error: Session lost.");
-  }
-  const userEmail = req.session.user.email;
-  const parentFolderId = process.env.DRIVE_PDF_FOLDER_ID;
-  const googleFormsLink = process.env.GOOGLE_FORMS_LINK || '#'; // Fallback link
-
-  console.log(`View request for: ${requestedFilename} by ${userEmail}`);
-
-  let fileId = null;
+  const code = req.query.code;
+  if (!code) return res.status(400).send('Missing authorization code.');
 
   try {
-    // 1. Check Approval AND get Full Name from Sheet
-    const sheetFullName = await getApprovedUserName(userEmail);
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
 
+    const userInfo = await oauth2Client.request({ url: 'https://www.googleapis.com/oauth2/v3/userinfo' });
+    const user = {
+      email: userInfo.data.email,
+      googleName: userInfo.data.name,
+    };
+
+    req.session.user = user;
+    req.session.save(err => {
+      if (err) return res.status(500).send('Authentication failed during session save.');
+      res.redirect('https://sites.google.com/view/byzant');
+    });
+  } catch (error) {
+    console.error('OAuth callback error:', error.response?.data || error.message);
+    res.status(500).send('Authentication failed');
+  }
+});
+
+app.get('/logout', (req, res) => {
+  const userEmail = req.session.user ? req.session.user.email : 'User';
+  req.session.destroy(err => {
+    if (err) return res.status(500).send('Could not log out.');
+    res.clearCookie('connect.sid');
+    res.redirect('https://sites.google.com/view/byzant');
+  });
+});
+
+app.get('/view/:filename', isAuthenticated, async (req, res) => {
+  const requestedFilename = req.params.filename;
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Vary', 'Cookie');
+
+  if (!requestedFilename || !requestedFilename.toLowerCase().endsWith('.pdf')) {
+    return res.status(400).send('Invalid request: Filename must end with .pdf');
+  }
+  if (requestedFilename.includes('/') || requestedFilename.includes('..')) {
+    return res.status(400).send('Invalid filename.');
+  }
+
+  const userEmail = req.session.user.email;
+  const parentFolderId = process.env.DRIVE_PDF_FOLDER_ID;
+  const googleFormsLink = process.env.GOOGLE_FORMS_LINK || '#';
+
+  try {
+    const sheetFullName = await getApprovedUserName(userEmail);
     if (sheetFullName === null) {
-      console.log(`Access denied for ${userEmail} (Not Approved or Not Found in Sheet)`);
-      // Send back HTML denial message (Cache headers already set)
-      res.status(403).send(`
+      return res.status(403).send(`
         <html>
           <head><title>Access Denied</title></head>
           <body style="font-family: sans-serif; padding: 20px;">
             <h1>Access Denied</h1>
             <p>Your email (${userEmail}) is logged in, but has not yet been approved.</p>
-            <p>If you haven't registered yet, please fill out the access request form:</p>
             <p><a href="${googleFormsLink}" target="_blank">Request Access Form</a></p>
-            <p>If you have already registered, please wait for your request to be approved. Thank you for your patience.</p>
+            <p>Please wait for approval.</p>
           </body>
         </html>
       `);
-      return; // Stop execution
     }
 
     const nameForWatermark = sheetFullName || 'Approved User';
-    console.log(`Access granted for ${userEmail}. Using name: "${nameForWatermark}"`);
+    const safeUserName = nameForWatermark.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const cacheKey = `${requestedFilename}_${safeUserName}`;
+    const cachedPDF = pdfCache.get(cacheKey);
+    if (cachedPDF) {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename="${requestedFilename}"`);
+      return res.send(cachedPDF);
+    }
 
-    // 2. Find File ID in Google Drive by Name
-    console.log(`Searching for filename "${requestedFilename}" in folder ID "${parentFolderId}"`);
-    const searchResponse = await drive.files.list({
+    const driveCacheKey = `original_${requestedFilename}`;
+    let pdfBytes = driveCache.get(driveCacheKey);
+
+    if (!pdfBytes) {
+      const searchResponse = await drive.files.list({
         q: `name='${requestedFilename}' and '${parentFolderId}' in parents and trashed=false`,
         fields: 'files(id, name)',
         spaces: 'drive',
-    });
+      });
 
-    if (!searchResponse.data.files || searchResponse.data.files.length === 0) {
-        console.log(`File not found in Drive: ${requestedFilename}`);
-        // Send 404 with cache headers already set
+      if (!searchResponse.data.files?.length) {
         return res.status(404).send('File not found.');
-    }
-    if (searchResponse.data.files.length > 1) {
-        console.warn(`Multiple files found with name: ${requestedFilename}. Using the first one found (ID: ${searchResponse.data.files[0].id}).`);
-    }
+      }
 
-    fileId = searchResponse.data.files[0].id;
-    const actualFilename = searchResponse.data.files[0].name;
-    console.log(`Found file ID: ${fileId} for filename: ${actualFilename}`);
-
-    // 3. Fetch from Google Drive using File ID
-    const fileResponse = await drive.files.get(
-        { fileId: fileId, alt: 'media' },
+      const fileId = searchResponse.data.files[0].id;
+      const fileResponse = await drive.files.get(
+        { fileId, alt: 'media' },
         { responseType: 'arraybuffer' }
-    );
-    const pdfBytes = Buffer.from(fileResponse.data);
-    console.log(`Fetched ${pdfBytes.length} bytes from Drive.`);
+      );
+      pdfBytes = Buffer.from(fileResponse.data);
+      driveCache.set(driveCacheKey, pdfBytes);
+    }
 
-    // 4. Watermark with pdf-lib (using name from sheet)
-    console.log(`Watermarking PDF for ${nameForWatermark} (${userEmail})`);
     const pdfDoc = await PDFDocument.load(pdfBytes);
     const obliqueFont = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
     const timestamp = new Date().toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' });
     const watermarkText = `Authorized liturgical use for ${nameForWatermark}. Generated: ${timestamp}`;
     const pages = pdfDoc.getPages();
-    const fontSize = 8; const textGray = rgb(0.5, 0.5, 0.5);
-    pages.forEach(page => { page.drawText(watermarkText, { x: 30, y: 20, size: fontSize, font: obliqueFont, color: textGray }); });
+    pages.forEach(page => {
+      page.drawText(watermarkText, {
+        x: 30, y: 20, size: 8, font: obliqueFont, color: rgb(0.5, 0.5, 0.5)
+      });
+    });
     const watermarkedPdfBytes = await pdfDoc.save();
-    console.log(`Watermarked PDF size: ${watermarkedPdfBytes.length} bytes.`);
+    pdfCache.set(cacheKey, watermarkedPdfBytes);
 
-    // 5. Send the watermarked PDF
-    const safeUserName = nameForWatermark.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-    const outputFilename = `${path.parse(actualFilename).name}_${safeUserName}.pdf`;
-    // Set Content-Type and Disposition (Cache headers already set)
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename="${outputFilename}"`);
+    res.setHeader('Content-Disposition', `inline; filename="${requestedFilename}"`);
     res.send(Buffer.from(watermarkedPdfBytes));
-
   } catch (error) {
-    // Error Handling (Cache headers already set)
-    let fileIdForError = 'N/A';
-     if (typeof fileId !== 'undefined') { fileIdForError = fileId; }
-    if (error.response && error.response.status) {
-         console.error(`Google API Error (Status: ${error.response.status}) during operation for file '${requestedFilename}' (Drive ID: ${fileIdForError}):`, error.response.data || error.message);
-         const status = error.response.status;
-         if (status === 404) { res.status(404).send('File not found in Drive or backend lacks permission.'); }
-         else if (status === 403) { res.status(403).send('Permission denied accessing Google Drive/Sheets. Check API Key restrictions or Service Account permissions.'); }
-         else { res.status(500).send('Error communicating with Google services.'); }
-    } else if (error.message.includes('Sheet')) {
-         console.error('Error accessing Google Sheet:', error);
-         res.status(500).send('Error checking user approval.');
-    } else {
-        console.error(`Generic error during file viewing/watermarking for ${requestedFilename}:`, error);
-        res.status(500).send('Error processing your request.');
-    }
+    console.error('View route error:', error);
+    res.status(500).send('Error processing your request.');
   }
 });
 
-
-// --- Start Server ---
 app.listen(port, () => {
-    console.log(`Byzantine backend listening at http://localhost:${port}`);
+  console.log(`Byzantine backend listening at http://localhost:${port}`);
 });
