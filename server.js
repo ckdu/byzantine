@@ -12,7 +12,8 @@ const port = process.env.PORT || 3000;
 
 // --- Caching Setup ---
 const driveCache = new NodeCache({ stdTTL: 86400 }); // 1 day for original PDFs
-const pdfCache = new NodeCache({ stdTTL: 7200 });   // 2 hours for watermarked PDFs
+const pdfCache = new NodeCache({ stdTTL: 7200 });    // 2 hours for watermarked PDFs
+const approvalCache = new NodeCache({ stdTTL: 7200 }); // 2 hours for approval (Google Sheet)
 
 // --- Google API Clients ---
 const oauth2Client = new OAuth2Client(
@@ -44,6 +45,10 @@ function isAuthenticated(req, res, next) {
 
 async function getApprovedUserName(email) {
   if (!email) return null;
+
+  const cached = approvalCache.get(email);
+  if (cached !== undefined) return cached;
+
   try {
     const columns = [
       process.env.EMAIL_COLUMN_LETTER,
@@ -73,15 +78,20 @@ async function getApprovedUserName(email) {
 
         if (rowEmail && rowEmail.toLowerCase() === email.toLowerCase()) {
           if (rowApprovedStatus && rowApprovedStatus.toUpperCase() === 'TRUE') {
-            return rowFullName || '';
+            const name = rowFullName || '';
+            approvalCache.set(email, name);
+            return name;
           } else {
             console.log(`Email ${email} found but not approved.`);
+            approvalCache.set(email, null);
             return null;
           }
         }
       }
     }
+
     console.log(`Email ${email} not found in the sheet.`);
+    approvalCache.set(email, null);
     return null;
   } catch (err) {
     console.error(`Error checking Google Sheet: ${err.response?.data?.error?.message || err.message}`);
@@ -179,7 +189,7 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     const safeUserName = nameForWatermark.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const cacheKey = `${requestedFilename}_${safeUserName}`;
     const cachedPDF = pdfCache.get(cacheKey);
-    if (cachedPDF) {
+    if (cachedPDF && Buffer.isBuffer(cachedPDF) && cachedPDF.length > 1000) {
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', `inline; filename="${requestedFilename}"`);
       return res.send(cachedPDF);
@@ -220,10 +230,10 @@ app.get('/view/:filename', isAuthenticated, async (req, res) => {
     });
     const watermarkedPdfBytes = Buffer.from(await pdfDoc.save());
     pdfCache.set(cacheKey, watermarkedPdfBytes);
-    
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${requestedFilename}"`);
-    res.send(watermarkedPdfBytes);    
+    res.send(watermarkedPdfBytes);
   } catch (error) {
     console.error('View route error:', error);
     res.status(500).send('Error processing your request.');
