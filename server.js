@@ -134,7 +134,7 @@ app.get('/auth/google/callback', async (req, res) => {
     req.session.user = user;
     req.session.save(err => {
       if (err) return res.status(500).send('Authentication failed during session save.');
-      res.redirect('https://sites.google.com/view/byzant');
+      res.redirect('https://www.byzantinemelody.org');
     });
   } catch (error) {
     console.error('OAuth callback error:', error.response?.data || error.message);
@@ -147,7 +147,7 @@ app.get('/logout', (req, res) => {
   req.session.destroy(err => {
     if (err) return res.status(500).send('Could not log out.');
     res.clearCookie('connect.sid');
-    res.redirect('https://sites.google.com/view/byzant');
+    res.redirect('https://www.byzantinemelody.org');
   });
 });
 
